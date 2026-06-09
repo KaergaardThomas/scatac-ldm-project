@@ -15,11 +15,12 @@
 #BSUB -J ldm_hematopoiesis
 #BSUB -o logs/ldm_%J.out
 #BSUB -e logs/ldm_%J.err
-#BSUB -q gpuh100
+#BSUB -q gpuv100
 #BSUB -n 4
 #BSUB -gpu "num=1:mode=exclusive_process"
 #BSUB -R "rusage[mem=32GB]"
 #BSUB -W 08:00
+
 
 # Uncomment to get email when job ends:
 ##BSUB -u s245829@dtu.dk
@@ -35,7 +36,7 @@ echo "============================="
 
 # ---- Modules ----------------------------------------------------------------
 module load python3/3.12.11
-module load cuda/12.1
+module load cuda/11.8
 
 # ---- uv ---------------------------------------------------------------------
 if ! command -v uv &> /dev/null; then

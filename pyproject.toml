@@ -1,0 +1,24 @@
+[project]
+name = "scatac-ldm"
+version = "0.1.0"
+description = "Latent Distance Models for sparse single-cell ATAC-seq data"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "scanpy>=1.9.0",
+    "anndata>=0.9.0",
+    "scipy>=1.10.0",
+    "scikit-learn>=1.2.0",
+    "numpy>=1.24.0",
+    "umap-learn>=0.5.0",
+    "matplotlib>=3.7.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "ipykernel>=6.0",
+    "jupyter>=1.0",
+    "ruff>=0.1.0",
+]

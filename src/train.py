@@ -150,8 +150,9 @@ def train(
     weight_decay: float = 1e-4,
     seed: int           = 42,
     out_dir: str        = "results/ldm_run",
-    val_frac: float     = 0.10,
-    eval_every: int     = 10,
+    val_frac: float       = 0.10,
+    eval_every: int       = 10,
+    min_cells_pct: float  = 0.05,
 ) -> dict:
     """Full training run. Returns history dict."""
 
@@ -163,7 +164,7 @@ def train(
     print(f"Device : {device}")
 
     # ---- Data ----------------------------------------------------------------
-    adata, X_bin = load_data(h5ad_path)
+    adata, X_bin = load_data(h5ad_path, min_cells_pct=min_cells_pct)
     train_edges, val_edges, n_cells, n_peaks = train_val_split(
         X_bin, val_frac=val_frac, seed=seed
     )
@@ -289,6 +290,7 @@ if __name__ == "__main__":
     p.add_argument("--out_dir",       type=str,   default="results/ldm_run")
     p.add_argument("--val_frac",      type=float, default=0.10)
     p.add_argument("--eval_every",    type=int,   default=10)
+    p.add_argument("--min_cells_pct", type=float, default=0.05)
     args = p.parse_args()
 
     train(
@@ -302,5 +304,6 @@ if __name__ == "__main__":
         seed         = args.seed,
         out_dir      = args.out_dir,
         val_frac     = args.val_frac,
-        eval_every   = args.eval_every,
+        eval_every     = args.eval_every,
+        min_cells_pct  = args.min_cells_pct,
     )

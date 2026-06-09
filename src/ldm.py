@@ -1,20 +1,26 @@
 """
-ldm.py — Latent Distance Model for scATAC-seq bipartite graph data.
+ldm.py — Latent Distance Model and Null Model for scATAC-seq bipartite graph data.
 
-Model
------
-Each cell i is assigned an embedding z_i ∈ R^d and a scalar intercept ψ_i.
-Each peak j is assigned an embedding z_j ∈ R^d and a scalar intercept ω_j.
+Models
+------
+LDM (full model):
+    Each cell i has embedding z_i ∈ R^d and intercept ψ_i.
+    Each peak j has embedding z_j ∈ R^d and intercept ω_j.
 
-The log-odds of observing a link between cell i and peak j is:
+    Log-odds:  η_ij = ψ_i + ω_j − ‖z_i − z_j‖₂
+    Probability: π_ij = σ(η_ij)
 
-    η_ij = ψ_i + ω_j − ‖z_i − z_j‖₂
+NullLDM (intercepts-only baseline):
+    Same intercepts as the full model, but no distance term.
 
-The probability of accessibility is:
+    Log-odds:  η⁰_ij = ψ_i + ω_j
+    Probability: π⁰_ij = σ(η⁰_ij)
 
-    π_ij = σ(η_ij)
-
-where σ is the sigmoid function.
+    The null model captures only the marginal accessibility rates per cell
+    and per peak, without any geometric structure. Comparing held-out
+    log-likelihood of LDM vs NullLDM quantifies how much explanatory
+    power the latent distance term contributes (nested model comparison,
+    following Hoff et al., 2002).
 
 Note
 ----
@@ -87,3 +93,60 @@ class LDM(nn.Module):
         dist = torch.norm(z_i - z_j, p=2, dim=-1)  # (B,)
         eta = psi + omega - dist                     # (B,)
         return eta
+
+
+class NullLDM(nn.Module):
+    """
+    Null model for nested comparison with LDM.
+
+    Contains only per-cell (ψ_i) and per-peak (ω_j) intercepts — no
+    latent embeddings and no distance term.
+
+    Log-odds:  η⁰_ij = ψ_i + ω_j
+
+    This model captures the marginal accessibility rates of each cell and
+    each peak, but encodes no geometric structure. By comparing the
+    held-out log-likelihood (or AUC-PR) of the full LDM against this
+    baseline, the contribution of the latent distance term can be directly
+    quantified (Hoff et al., 2002).
+
+    Parameters
+    ----------
+    n_cells : int
+    n_peaks : int
+    """
+
+    def __init__(self, n_cells: int, n_peaks: int):
+        super().__init__()
+        self.n_cells = n_cells
+        self.n_peaks = n_peaks
+
+        # Cell intercepts: ψ_i ∈ R
+        self.psi = nn.Embedding(n_cells, 1)
+        # Peak intercepts: ω_j ∈ R
+        self.omega = nn.Embedding(n_peaks, 1)
+
+        nn.init.zeros_(self.psi.weight)
+        nn.init.zeros_(self.omega.weight)
+
+    def forward(
+        self,
+        cell_idx: torch.Tensor,
+        peak_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute predicted log-odds η⁰_ij for a batch of (cell, peak) pairs.
+
+        Parameters
+        ----------
+        cell_idx : LongTensor of shape (B,)
+        peak_idx : LongTensor of shape (B,)
+
+        Returns
+        -------
+        eta : FloatTensor of shape (B,)
+            η⁰_ij = ψ_i + ω_j
+        """
+        psi   = self.psi(cell_idx).squeeze(-1)    # (B,)
+        omega = self.omega(peak_idx).squeeze(-1)   # (B,)
+        return psi + omega

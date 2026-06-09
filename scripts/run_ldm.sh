@@ -21,7 +21,6 @@
 #BSUB -R "rusage[mem=32GB]"
 #BSUB -W 08:00
 
-
 # Uncomment to get email when job ends:
 ##BSUB -u s245829@dtu.dk
 ##BSUB -N
@@ -55,9 +54,15 @@ mkdir -p logs results/ldm_run
 echo "PyTorch version and GPU:"
 uv run python -c "import torch; print(torch.__version__); print('CUDA:', torch.cuda.is_available()); print('Device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
 
+# ---- Copy data to local scratch (avoids slow NFS hang) ----------------------
+echo "Copying data to local scratch..."
+cp "$HOME/data/hematopoiesis_GSE129785_FACS_sorted.h5ad" "$TMPDIR/"
+DATA="$TMPDIR/hematopoiesis_GSE129785_FACS_sorted.h5ad"
+echo "Done copying. Starting training..."
+
 # ---- Run --------------------------------------------------------------------
 uv run python src/train.py \
-    --data          "$HOME/data/hematopoiesis_GSE129785_FACS_sorted.h5ad" \
+    --data          "$DATA" \
     --latent_dim    8 \
     --epochs        200 \
     --batch_size    4096 \

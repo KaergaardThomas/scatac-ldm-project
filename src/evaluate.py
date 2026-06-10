@@ -1,18 +1,31 @@
 """
-evaluate.py — Evaluation script for the Latent Distance Model.
+evaluate.py — Post-training evaluation for the Latent Distance Model.
 
-Covers:
-    RQ1 (Embedding quality):
-        - K-means clustering (k=5) on LDM cell embeddings
-        - ARI and NMI against FACS-derived cell type labels
-        - UMAP visualisation coloured by cell type and cluster
-        - LSA/TF-IDF baseline (TruncatedSVD) with same evaluation
+Covers the two research questions.
 
-    RQ2 (Link prediction):
-        - Nested model comparison: LDM vs Null model
-        - Prints a summary table of BCE, AUC-ROC, AUC-PR
+RQ1 (Embedding quality):
+    - K-means clustering on the LDM cell embeddings (z_cells.npy).
+    - ARI and NMI against FACS-derived cell type labels from the AnnData object.
+    - UMAP visualisation coloured by cell type and by K-means cluster.
+    - LSA/TF-IDF baseline (TruncatedSVD, 50 components, L2-normalised),
+      evaluated identically (K-means + ARI/NMI + UMAP), following PeakVI.
 
-Usage (from repo root, after training has completed):
+RQ2 (Link prediction):
+    - Nested model comparison: full LDM vs null model.
+    - Prints a summary table of held-out BCE, AUC-ROC, AUC-PR and F1, read
+      from the best checkpoint recorded in each model's history file.
+
+All figures are written as PNG and a machine-readable summary.json is saved.
+
+Number of clusters
+------------------
+The number of K-means clusters defaults to the number of distinct FACS cell
+type labels present in the data. The k=5 used for the PBMC reference came from
+the PeakVI clustering of that dataset and does not transfer to the FACS-sorted
+hematopoiesis data, which has a different number of sorted populations. Pass
+``--k`` to override (e.g. ``--k 5`` to reproduce the PBMC-era setting).
+
+Usage (from repo root, after both models have been trained):
     uv run python src/evaluate.py \\
         --data      data/hematopoiesis_GSE129785_FACS_sorted.h5ad \\
         --ldm_dir   results/ldm_run \\
@@ -29,13 +42,11 @@ import matplotlib
 matplotlib.use("Agg")  # non-interactive backend for HPC
 import matplotlib.pyplot as plt
 import numpy as np
-import scanpy as sc
+import scipy.sparse as sp
+from matplotlib import colormaps
 from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
-from sklearn.metrics import (
-    adjusted_rand_score,
-    normalized_mutual_info_score,
-)
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 from sklearn.preprocessing import normalize
 from umap import UMAP
 
@@ -52,14 +63,38 @@ def load_history(path: str) -> dict:
         return json.load(f)
 
 
+def final_metrics(hist: dict) -> dict:
+    """
+    Pull the reported held-out metrics from a history dict.
+
+    Prefers the ``best`` block written at the best-AUC-PR checkpoint; falls
+    back to the last recorded evaluation if ``best`` is absent.
+    """
+    if isinstance(hist.get("best"), dict):
+        b = hist["best"]
+    else:
+        b = {
+            "val_bce":     hist["val_bce"][-1],
+            "val_auc_roc": hist["val_auc_roc"][-1],
+            "val_auc_pr":  hist["val_auc_pr"][-1],
+            "val_f1":      hist.get("val_f1", [float("nan")])[-1],
+        }
+    return {
+        "val_bce":     b["val_bce"],
+        "val_auc_roc": b["val_auc_roc"],
+        "val_auc_pr":  b["val_auc_pr"],
+        "val_f1":      b.get("val_f1", float("nan")),
+    }
+
+
 def cluster_and_score(
     embeddings: np.ndarray,
     true_labels: np.ndarray,
-    k: int = 5,
+    k: int,
     seed: int = 42,
     label: str = "",
 ) -> dict:
-    """Run K-means and compute ARI and NMI against true labels."""
+    """Run K-means and compute ARI and NMI against the true labels."""
     km = KMeans(n_clusters=k, random_state=seed, n_init=10)
     pred_labels = km.fit_predict(embeddings)
     ari = adjusted_rand_score(true_labels, pred_labels)
@@ -82,17 +117,16 @@ def plot_umap(
     label_name: str = "Cell type",
 ):
     """Save a UMAP scatter plot coloured by labels."""
+    labels = np.asarray(labels).astype(str)
     unique_labels = np.unique(labels)
-    cmap = plt.cm.get_cmap("tab20", len(unique_labels))
-    label_to_int = {l: i for i, l in enumerate(unique_labels)}
-    colors = [cmap(label_to_int[l]) for l in labels]
+    cmap = colormaps["tab20"].resampled(max(len(unique_labels), 1))
 
     fig, ax = plt.subplots(figsize=(8, 6))
     for i, lab in enumerate(unique_labels):
         mask = labels == lab
         ax.scatter(
             coords[mask, 0], coords[mask, 1],
-            c=[cmap(i)], s=2, alpha=0.5, label=str(lab), rasterized=True,
+            color=[cmap(i)], s=2, alpha=0.5, label=lab, rasterized=True,
         )
     ax.set_title(title, fontsize=13)
     ax.set_xlabel("UMAP 1")
@@ -108,51 +142,47 @@ def plot_umap(
 
 
 # ---------------------------------------------------------------------------
-# LSA baseline
+# LSA / TF-IDF baseline
 # ---------------------------------------------------------------------------
 
 def run_lsa(
-    X_bin,
+    X_bin: sp.csr_matrix,
     true_labels: np.ndarray,
+    k: int,
     n_components: int = 50,
-    k: int = 5,
     seed: int = 42,
     out_dir: str = "results/evaluation",
 ) -> dict:
     """
-    LSA/TF-IDF baseline following PeakVI paper:
-        1. Binarise (already done)
-        2. TF-IDF transform
-        3. TruncatedSVD (top 50 components)
-        4. L2-normalise rows
-        5. K-means + ARI/NMI + UMAP
+    LSA/TF-IDF baseline following the PeakVI paper:
+        1. Binarise (already done in load_data).
+        2. TF-IDF transform (binary TF, IDF = log(N / df)).
+        3. TruncatedSVD (top 50 components).
+        4. L2-normalise rows.
+        5. K-means + ARI/NMI + UMAP, identical to the LDM evaluation.
     """
-    print("\n--- LSA/TF-IDF Baseline ---")
+    print("\n--- LSA / TF-IDF Baseline ---")
 
-    # TF-IDF: term = peak, document = cell
-    # TF = binary (already), IDF = log(N / df)
-    import scipy.sparse as sp
+    # TF-IDF: term = peak, document = cell. TF is binary; IDF = log(N / df).
     X = X_bin.astype(np.float32)
     N = X.shape[0]
     df = np.asarray((X > 0).sum(axis=0)).ravel()
     idf = np.log1p(N / (df + 1))
-    # Multiply each column by its IDF
     X_tfidf = X.multiply(idf)
 
-    # TruncatedSVD
     svd = TruncatedSVD(n_components=n_components, random_state=seed)
     Z_lsa = svd.fit_transform(X_tfidf)
     Z_lsa = normalize(Z_lsa, norm="l2")
-    print(f"  LSA embeddings: {Z_lsa.shape}")
+    print(f"  LSA embeddings : {Z_lsa.shape}  "
+          f"(explained var. {svd.explained_variance_ratio_.sum():.4f})")
 
     scores = cluster_and_score(Z_lsa, true_labels, k=k, seed=seed, label="LSA")
 
-    # UMAP
     print("  Computing UMAP for LSA...")
     umap_coords = compute_umap(Z_lsa, seed=seed)
     plot_umap(
         umap_coords, true_labels,
-        title="LSA — Cell type",
+        title="LSA / TF-IDF — Cell type (FACS)",
         out_path=os.path.join(out_dir, "umap_lsa_celltype.png"),
     )
 
@@ -160,7 +190,7 @@ def run_lsa(
     return {
         "ari": scores["ari"],
         "nmi": scores["nmi"],
-        "explained_variance_ratio": svd.explained_variance_ratio_.sum(),
+        "explained_variance_ratio": float(svd.explained_variance_ratio_.sum()),
     }
 
 
@@ -173,128 +203,128 @@ def evaluate(
     ldm_dir: str,
     null_dir: str,
     out_dir: str,
-    k: int = 5,
+    k: int = None,
     seed: int = 42,
+    label_col: str = None,
+    min_cells_pct: float = 0.001,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
     # ---- Load data -----------------------------------------------------------
     print("Loading data...")
-    adata, X_bin = load_data(h5ad_path)
+    adata, X_bin = load_data(h5ad_path, min_cells_pct=min_cells_pct)
 
-    # Extract FACS cell type labels
-    # Try common column names used in the hematopoiesis dataset
-    label_col = None
-    for col in ["cell_type", "CellType", "celltype", "BioClassification",
-                "label", "Group", "cluster"]:
-        if col in adata.obs.columns:
-            label_col = col
-            break
-
+    # Resolve the FACS cell type label column
     if label_col is None:
+        for col in ["cell_type", "CellType", "celltype", "BioClassification",
+                    "label", "Group", "cluster"]:
+            if col in adata.obs.columns:
+                label_col = col
+                break
+    if label_col is None or label_col not in adata.obs.columns:
         print(f"  Available obs columns: {list(adata.obs.columns)}")
         raise ValueError(
-            "Could not find cell type labels in adata.obs. "
-            "Check the column name above and pass it via --label_col."
+            "Could not find a cell type column in adata.obs. "
+            "Pass it explicitly via --label_col."
         )
 
-    true_labels = adata.obs[label_col].values
+    true_labels = np.asarray(adata.obs[label_col].values)
     unique_labels = np.unique(true_labels)
+    n_types = len(unique_labels)
     print(f"  Cell type column : '{label_col}'")
-    print(f"  Cell types ({len(unique_labels)}): {unique_labels}")
+    print(f"  Cell types ({n_types}) : {unique_labels}")
+
+    # Number of clusters: default to the number of FACS cell types
+    if k is None:
+        k = n_types
+        print(f"  Using k={k} (number of FACS cell types)")
+    else:
+        print(f"  Using k={k} (user-specified)")
 
     # ---- RQ1: Embedding quality ----------------------------------------------
     print("\n=== RQ1: Embedding Quality ===")
 
-    # Load LDM cell embeddings
     z_cells_path = os.path.join(ldm_dir, "z_cells.npy")
     if not os.path.exists(z_cells_path):
         raise FileNotFoundError(
-            f"LDM embeddings not found at {z_cells_path}. "
-            "Has training completed?"
+            f"LDM embeddings not found at {z_cells_path}. Has training completed?"
         )
     z_cells = np.load(z_cells_path)
-    print(f"  LDM cell embeddings: {z_cells.shape}")
+    print(f"  LDM cell embeddings : {z_cells.shape}")
 
-    # K-means + ARI/NMI on LDM embeddings
-    print("\nClustering scores (k=5):")
+    if z_cells.shape[0] != adata.n_obs:
+        raise ValueError(
+            f"Row mismatch: z_cells has {z_cells.shape[0]} rows but the data has "
+            f"{adata.n_obs} cells. Ensure --data matches the training run."
+        )
+
+    print(f"\nClustering scores (k={k}):")
     ldm_scores = cluster_and_score(
         z_cells, true_labels, k=k, seed=seed, label="LDM"
     )
 
-    # UMAP of LDM embeddings
     print("\n  Computing UMAP for LDM cell embeddings...")
     umap_coords = compute_umap(z_cells, seed=seed)
-
     plot_umap(
         umap_coords, true_labels,
         title="LDM Cell Embeddings — Cell type (FACS)",
         out_path=os.path.join(out_dir, "umap_ldm_celltype.png"),
     )
     plot_umap(
-        umap_coords,
-        ldm_scores["pred_labels"].astype(str),
+        umap_coords, ldm_scores["pred_labels"],
         title="LDM Cell Embeddings — K-means clusters",
         out_path=os.path.join(out_dir, "umap_ldm_kmeans.png"),
         label_name="Cluster",
     )
     np.save(os.path.join(out_dir, "umap_ldm_coords.npy"), umap_coords)
 
-    # LSA baseline
+    # LSA baseline (same k, same evaluation)
     lsa_scores = run_lsa(X_bin, true_labels, k=k, seed=seed, out_dir=out_dir)
 
-    # ---- RQ2: Link prediction ------------------------------------------------
+    # ---- RQ2: Link prediction (nested model comparison) ----------------------
     print("\n=== RQ2: Link Prediction (Nested Model Comparison) ===")
 
+    results = {}
     ldm_hist_path  = os.path.join(ldm_dir,  "history.json")
     null_hist_path = os.path.join(null_dir, "null_history.json")
 
-    results = {}
-
     if os.path.exists(ldm_hist_path):
-        ldm_hist = load_history(ldm_hist_path)
-        results["ldm"] = {
-            "val_bce":     ldm_hist["val_bce"][-1],
-            "val_auc_roc": ldm_hist["val_auc_roc"][-1],
-            "val_auc_pr":  ldm_hist["val_auc_pr"][-1],
-        }
+        results["ldm"] = final_metrics(load_history(ldm_hist_path))
     else:
         print("  WARNING: LDM history not found — skipping RQ2 for LDM")
-
     if os.path.exists(null_hist_path):
-        null_hist = load_history(null_hist_path)
-        results["null"] = {
-            "val_bce":     null_hist["val_bce"][-1],
-            "val_auc_roc": null_hist["val_auc_roc"][-1],
-            "val_auc_pr":  null_hist["val_auc_pr"][-1],
-        }
+        results["null"] = final_metrics(load_history(null_hist_path))
     else:
-        print("  WARNING: Null model history not found — skipping RQ2 for null")
+        print("  WARNING: null history not found — skipping RQ2 for null")
 
-    # ---- Summary table -------------------------------------------------------
+    # ---- Summary tables ------------------------------------------------------
     print("\n=== Summary ===")
-    print(f"\n{'Model':<12} {'Val BCE':>10} {'AUC-ROC':>10} {'AUC-PR':>10}")
-    print("-" * 45)
-
-    if "ldm" in results:
-        r = results["ldm"]
-        print(f"{'LDM':<12} {r['val_bce']:>10.4f} "
-              f"{r['val_auc_roc']:>10.4f} {r['val_auc_pr']:>10.4f}")
-    if "null" in results:
-        r = results["null"]
-        print(f"{'Null model':<12} {r['val_bce']:>10.4f} "
-              f"{r['val_auc_roc']:>10.4f} {r['val_auc_pr']:>10.4f}")
+    print(f"\n{'Model':<12} {'Val BCE':>10} {'AUC-ROC':>10} "
+          f"{'AUC-PR':>10} {'F1':>10}")
+    print("-" * 56)
+    for name, key in [("LDM", "ldm"), ("Null model", "null")]:
+        if key in results:
+            r = results[key]
+            print(f"{name:<12} {r['val_bce']:>10.4f} {r['val_auc_roc']:>10.4f} "
+                  f"{r['val_auc_pr']:>10.4f} {r['val_f1']:>10.4f}")
 
     print(f"\n{'Method':<12} {'ARI':>10} {'NMI':>10}")
     print("-" * 35)
     print(f"{'LDM':<12} {ldm_scores['ari']:>10.4f} {ldm_scores['nmi']:>10.4f}")
     print(f"{'LSA':<12} {lsa_scores['ari']:>10.4f} {lsa_scores['nmi']:>10.4f}")
 
-    # Save summary
+    # ---- Save summary --------------------------------------------------------
     summary = {
         "rq1": {
-            "ldm":  {"ari": ldm_scores["ari"], "nmi": ldm_scores["nmi"]},
-            "lsa":  {"ari": lsa_scores["ari"],  "nmi": lsa_scores["nmi"]},
+            "k": int(k),
+            "n_cell_types": int(n_types),
+            "cell_type_column": label_col,
+            "ldm": {"ari": ldm_scores["ari"], "nmi": ldm_scores["nmi"]},
+            "lsa": {
+                "ari": lsa_scores["ari"],
+                "nmi": lsa_scores["nmi"],
+                "explained_variance_ratio": lsa_scores["explained_variance_ratio"],
+            },
         },
         "rq2": results,
     }
@@ -308,22 +338,29 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Evaluate LDM results")
-    p.add_argument("--data",      required=True,  help="Path to .h5ad file")
+    p = argparse.ArgumentParser(description="Evaluate LDM results (RQ1 + RQ2)")
+    p.add_argument("--data",      required=True, help="Path to .h5ad file")
     p.add_argument("--ldm_dir",   default="results/ldm_run")
     p.add_argument("--null_dir",  default="results/null_run")
     p.add_argument("--out_dir",   default="results/evaluation")
-    p.add_argument("--k",         type=int, default=5)
+    p.add_argument("--k",         type=int, default=None,
+                   help="K-means clusters. Default: number of FACS cell types "
+                        "(the PBMC reference used k=5).")
     p.add_argument("--seed",      type=int, default=42)
+    # Optional extras (do not affect the required interface)
     p.add_argument("--label_col", type=str, default=None,
-                   help="Override obs column name for cell type labels")
+                   help="Override the obs column holding FACS cell type labels.")
+    p.add_argument("--min_cells_pct", type=float, default=0.001,
+                   help="Peak filter; must match the training run (PeakVI: 0.001).")
     args = p.parse_args()
 
     evaluate(
-        h5ad_path = args.data,
-        ldm_dir   = args.ldm_dir,
-        null_dir  = args.null_dir,
-        out_dir   = args.out_dir,
-        k         = args.k,
-        seed      = args.seed,
+        h5ad_path     = args.data,
+        ldm_dir       = args.ldm_dir,
+        null_dir      = args.null_dir,
+        out_dir       = args.out_dir,
+        k             = args.k,
+        seed          = args.seed,
+        label_col     = args.label_col,
+        min_cells_pct = args.min_cells_pct,
     )

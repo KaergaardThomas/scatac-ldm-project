@@ -22,11 +22,21 @@ NullLDM (intercepts-only baseline):
     power the latent distance term contributes (nested model comparison,
     following Hoff et al., 2002).
 
+Distance term
+-------------
+The Euclidean norm ‖z_i − z_j‖₂ matches Equation (1) of the report and the
+distance parameterisation of Hoff et al. (2002). It is computed as
+    ‖z_i − z_j‖₂ = sqrt( Σ_d (z_i − z_j)_d² + ε )
+The small ε guards the gradient of the square root at z_i = z_j, where the
+plain Euclidean norm has an undefined (0/0) gradient that otherwise produces
+NaNs during optimisation. With ε = 1e-8 the value is indistinguishable from
+the true norm for any non-degenerate separation.
+
 Note
 ----
-False-negative filtering is deliberately omitted following the SIMBA convention.
-Zeros in the training set include genuine negatives and technical dropouts alike;
-this choice is discussed in the project report.
+False-negative filtering is deliberately omitted at training time following
+the SIMBA convention. Zeros in the training set include genuine negatives and
+technical dropouts alike; this choice is discussed in the project report.
 """
 
 import torch
@@ -45,13 +55,18 @@ class LDM(nn.Module):
         Number of genomic peaks (columns of the accessibility matrix).
     latent_dim : int
         Dimensionality d of the shared latent embedding space.
+    eps : float
+        Numerical-stability constant added under the square root of the
+        Euclidean distance to keep its gradient finite at zero separation.
     """
 
-    def __init__(self, n_cells: int, n_peaks: int, latent_dim: int = 8):
+    def __init__(self, n_cells: int, n_peaks: int, latent_dim: int = 8,
+                 eps: float = 1e-8):
         super().__init__()
         self.n_cells = n_cells
         self.n_peaks = n_peaks
         self.latent_dim = latent_dim
+        self.eps = eps
 
         # Cell embeddings: z_i ∈ R^d
         self.z_i = nn.Embedding(n_cells, latent_dim)
@@ -85,13 +100,15 @@ class LDM(nn.Module):
         eta : FloatTensor of shape (B,)
             η_ij = ψ_i + ω_j − ‖z_i − z_j‖₂
         """
-        z_i = self.z_i(cell_idx)                 # (B, d)
-        z_j = self.z_j(peak_idx)                 # (B, d)
+        z_i = self.z_i(cell_idx)                  # (B, d)
+        z_j = self.z_j(peak_idx)                  # (B, d)
         psi = self.psi(cell_idx).squeeze(-1)      # (B,)
         omega = self.omega(peak_idx).squeeze(-1)  # (B,)
 
-        dist = torch.norm(z_i - z_j, p=2, dim=-1)  # (B,)
-        eta = psi + omega - dist                     # (B,)
+        # Euclidean distance with epsilon under the root for a finite gradient
+        sq_dist = torch.sum((z_i - z_j) ** 2, dim=-1)   # (B,)
+        dist = torch.sqrt(sq_dist + self.eps)           # (B,)
+        eta = psi + omega - dist                        # (B,)
         return eta
 
 
@@ -147,6 +164,6 @@ class NullLDM(nn.Module):
         eta : FloatTensor of shape (B,)
             η⁰_ij = ψ_i + ω_j
         """
-        psi   = self.psi(cell_idx).squeeze(-1)    # (B,)
-        omega = self.omega(peak_idx).squeeze(-1)   # (B,)
+        psi = self.psi(cell_idx).squeeze(-1)      # (B,)
+        omega = self.omega(peak_idx).squeeze(-1)  # (B,)
         return psi + omega

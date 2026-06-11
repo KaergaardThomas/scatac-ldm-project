@@ -61,26 +61,33 @@ class LDM(nn.Module):
     """
 
     def __init__(self, n_cells: int, n_peaks: int, latent_dim: int = 8,
-                 eps: float = 1e-8):
+                 eps: float = 1e-8, use_intercepts: bool = True,
+                 init_std: float = 0.1):
         super().__init__()
         self.n_cells = n_cells
         self.n_peaks = n_peaks
         self.latent_dim = latent_dim
         self.eps = eps
+        self.use_intercepts = use_intercepts
 
-        # Cell embeddings: z_i ∈ R^d
+        # Cell embeddings: z_i ∈ R^d  and  peak embeddings: z_j ∈ R^d
         self.z_i = nn.Embedding(n_cells, latent_dim)
-        # Peak embeddings: z_j ∈ R^d
         self.z_j = nn.Embedding(n_peaks, latent_dim)
-        # Cell intercepts: ψ_i ∈ R
-        self.psi = nn.Embedding(n_cells, 1)
-        # Peak intercepts: ω_j ∈ R
-        self.omega = nn.Embedding(n_peaks, 1)
+        nn.init.normal_(self.z_i.weight, mean=0.0, std=init_std)
+        nn.init.normal_(self.z_j.weight, mean=0.0, std=init_std)
 
-        nn.init.normal_(self.z_i.weight, mean=0.0, std=0.1)
-        nn.init.normal_(self.z_j.weight, mean=0.0, std=0.1)
-        nn.init.zeros_(self.psi.weight)
-        nn.init.zeros_(self.omega.weight)
+        if use_intercepts:
+            # Per-node intercepts ψ_i, ω_j — capture marginal cell/peak rates.
+            self.psi = nn.Embedding(n_cells, 1)
+            self.omega = nn.Embedding(n_peaks, 1)
+            nn.init.zeros_(self.psi.weight)
+            nn.init.zeros_(self.omega.weight)
+        else:
+            # Ablation: a single global bias replaces the per-node intercepts,
+            # so the marginal-rate "shortcut" is removed and the distance term
+            # has to carry the signal. The scalar keeps probabilities
+            # calibratable (η = β₀ − ‖z_i − z_j‖, so π is not capped at 0.5).
+            self.bias = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -102,14 +109,16 @@ class LDM(nn.Module):
         """
         z_i = self.z_i(cell_idx)                  # (B, d)
         z_j = self.z_j(peak_idx)                  # (B, d)
-        psi = self.psi(cell_idx).squeeze(-1)      # (B,)
-        omega = self.omega(peak_idx).squeeze(-1)  # (B,)
 
         # Euclidean distance with epsilon under the root for a finite gradient
         sq_dist = torch.sum((z_i - z_j) ** 2, dim=-1)   # (B,)
         dist = torch.sqrt(sq_dist + self.eps)           # (B,)
-        eta = psi + omega - dist                        # (B,)
-        return eta
+
+        if self.use_intercepts:
+            psi = self.psi(cell_idx).squeeze(-1)      # (B,)
+            omega = self.omega(peak_idx).squeeze(-1)  # (B,)
+            return psi + omega - dist                 # (B,)
+        return self.bias - dist                       # (B,)
 
 
 class NullLDM(nn.Module):

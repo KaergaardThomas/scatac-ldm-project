@@ -242,6 +242,8 @@ def train(
     min_cells_pct: float  = 0.001,
     eval_max_pos: int     = 1_000_000,
     filter_eval_neg: bool = True,
+    use_intercepts: bool  = True,
+    init_std: float       = 0.1,
 ) -> dict:
     """Full training run. Returns history dict."""
 
@@ -268,15 +270,21 @@ def train(
     )
 
     # ---- Model ---------------------------------------------------------------
-    model = LDM(n_cells=n_cells, n_peaks=n_peaks, latent_dim=latent_dim).to(device)
+    model = LDM(n_cells=n_cells, n_peaks=n_peaks, latent_dim=latent_dim,
+                use_intercepts=use_intercepts, init_std=init_std).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Model  : {n_cells} cells, {n_peaks} peaks, "
-          f"dim={latent_dim}, params={n_params:,}")
+    print(f"Model  : {n_cells} cells, {n_peaks} peaks, dim={latent_dim}, "
+          f"intercepts={use_intercepts}, init_std={init_std}, params={n_params:,}")
 
-    # Weight decay (L2 prior, following SIMBA) on embeddings only, not intercepts
+    # Weight decay (L2 prior, following SIMBA) on the embeddings only; any bias
+    # terms (per-node intercepts or the global bias) are left unregularised.
+    # Built from named_parameters so it works with or without intercepts.
+    embed_params = [model.z_i.weight, model.z_j.weight]
+    bias_params = [p for n, p in model.named_parameters()
+                   if n not in ("z_i.weight", "z_j.weight")]
     optimizer = torch.optim.Adam([
-        {"params": [model.z_i.weight, model.z_j.weight], "weight_decay": weight_decay},
-        {"params": [model.psi.weight, model.omega.weight], "weight_decay": 0.0},
+        {"params": embed_params, "weight_decay": weight_decay},
+        {"params": bias_params,  "weight_decay": 0.0},
     ], lr=lr)
 
     # Positive edges resident on the device; negatives sampled per batch on device
@@ -420,6 +428,11 @@ if __name__ == "__main__":
                    help="Cap on held-out positives used for the fixed eval set.")
     p.add_argument("--no_filter_eval_neg", action="store_true",
                    help="Disable filtering observed positives out of eval negatives.")
+    p.add_argument("--no_intercepts", action="store_true",
+                   help="Ablation: drop per-node intercepts (use a single global "
+                        "bias) so the distance term must carry the signal.")
+    p.add_argument("--init_std", type=float, default=0.1,
+                   help="Std of the Gaussian embedding initialisation.")
     args = p.parse_args()
 
     train(
@@ -437,4 +450,6 @@ if __name__ == "__main__":
         min_cells_pct = args.min_cells_pct,
         eval_max_pos  = args.eval_max_pos,
         filter_eval_neg = not args.no_filter_eval_neg,
+        use_intercepts  = not args.no_intercepts,
+        init_std        = args.init_std,
     )

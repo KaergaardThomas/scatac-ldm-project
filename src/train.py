@@ -244,6 +244,7 @@ def train(
     filter_eval_neg: bool = True,
     use_intercepts: bool  = True,
     init_std: float       = 0.1,
+    log_every: int        = 0,
 ) -> dict:
     """Full training run. Returns history dict."""
 
@@ -315,6 +316,8 @@ def train(
 
         perm = torch.randperm(N, generator=gen, device=device)
         total_loss, total_n = 0.0, 0
+        run_loss, run_n, step = 0.0, 0, 0
+        steps_per_epoch = (N + batch_size - 1) // batch_size
 
         for s in range(0, N, batch_size):
             idx = perm[s:s + batch_size]
@@ -343,8 +346,16 @@ def train(
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * (B + M)
-            total_n += (B + M)
+            bs = B + M
+            total_loss += loss.item() * bs
+            total_n += bs
+            run_loss += loss.item() * bs
+            run_n += bs
+            step += 1
+            if log_every and step % log_every == 0:
+                print(f"  [epoch {epoch:3d}] step {step:6d}/{steps_per_epoch}  "
+                      f"train_bce={run_loss / run_n:.4f}", flush=True)
+                run_loss, run_n = 0.0, 0
 
         train_bce = total_loss / total_n
         elapsed = time.time() - t0
@@ -433,6 +444,8 @@ if __name__ == "__main__":
                         "bias) so the distance term must carry the signal.")
     p.add_argument("--init_std", type=float, default=0.1,
                    help="Std of the Gaussian embedding initialisation.")
+    p.add_argument("--log_every", type=int, default=0,
+                   help="Print running train BCE every N steps (0 = per-epoch only).")
     args = p.parse_args()
 
     train(
@@ -452,4 +465,5 @@ if __name__ == "__main__":
         filter_eval_neg = not args.no_filter_eval_neg,
         use_intercepts  = not args.no_intercepts,
         init_std        = args.init_std,
+        log_every       = args.log_every,
     )

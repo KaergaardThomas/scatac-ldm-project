@@ -303,6 +303,8 @@ def train(
         "val_threshold": [],
         "eval_epochs":  [],
         "epoch_time_s": [],
+        "step_bce":     [],
+        "step_global":  [],
     }
     best_val_auc_pr = -1.0
     best_state = None
@@ -310,6 +312,7 @@ def train(
     best_epoch = None
 
     # ---- Loop ----------------------------------------------------------------
+    global_step = 0
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         model.train()
@@ -352,9 +355,13 @@ def train(
             run_loss += loss.item() * bs
             run_n += bs
             step += 1
+            global_step += 1
             if log_every and step % log_every == 0:
+                step_bce_val = run_loss / run_n
                 print(f"  [epoch {epoch:3d}] step {step:6d}/{steps_per_epoch}  "
-                      f"train_bce={run_loss / run_n:.4f}", flush=True)
+                      f"train_bce={step_bce_val:.4f}", flush=True)
+                history["step_bce"].append(step_bce_val)
+                history["step_global"].append(global_step)
                 run_loss, run_n = 0.0, 0
 
         train_bce = total_loss / total_n

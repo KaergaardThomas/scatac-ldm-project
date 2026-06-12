@@ -41,6 +41,7 @@ import sys
 import matplotlib
 matplotlib.use("Agg")  # non-interactive backend for HPC
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
 import numpy as np
 import scipy.sparse as sp
 from matplotlib import colormaps
@@ -103,9 +104,10 @@ def cluster_and_score(
     return {"ari": ari, "nmi": nmi, "pred_labels": pred_labels}
 
 
-def compute_umap(embeddings: np.ndarray, seed: int = 42) -> np.ndarray:
-    """Compute 2D UMAP coordinates."""
-    reducer = UMAP(n_components=2, random_state=seed, min_dist=0.2)
+def compute_umap(embeddings: np.ndarray, seed: int = 42,
+                 n_components: int = 2) -> np.ndarray:
+    """Compute UMAP coordinates (2D by default; 3D when n_components=3)."""
+    reducer = UMAP(n_components=n_components, random_state=seed, min_dist=0.2)
     return reducer.fit_transform(embeddings)
 
 
@@ -141,9 +143,79 @@ def plot_umap(
     print(f"  Saved: {out_path}")
 
 
-# ---------------------------------------------------------------------------
-# LSA / TF-IDF baseline
-# ---------------------------------------------------------------------------
+def plot_umap_3d(
+    coords: np.ndarray,
+    labels: np.ndarray,
+    title: str,
+    out_path: str,
+    label_name: str = "Cell type",
+):
+    """Save a 3D UMAP scatter plot coloured by labels."""
+    labels = np.asarray(labels).astype(str)
+    unique_labels = np.unique(labels)
+    cmap = colormaps["tab20"].resampled(max(len(unique_labels), 1))
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(projection="3d")
+    for i, lab in enumerate(unique_labels):
+        mask = labels == lab
+        ax.scatter(
+            coords[mask, 0], coords[mask, 1], coords[mask, 2],
+            color=[cmap(i)], s=2, alpha=0.5, label=lab, rasterized=True,
+        )
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+    ax.set_zlabel("UMAP 3")
+    ax.legend(
+        title=label_name, markerscale=4,
+        bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=7,
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out_path}")
+
+
+def plot_joint_umap(
+    cell_coords: np.ndarray,
+    peak_coords: np.ndarray,
+    cell_labels: np.ndarray,
+    title: str,
+    out_path: str,
+    label_name: str = "Cell type",
+):
+    """
+    Save a joint cell+peak UMAP: peaks drawn as small grey dots in the
+    background, cells coloured by FACS cell type on top.
+    """
+    cell_labels = np.asarray(cell_labels).astype(str)
+    unique_labels = np.unique(cell_labels)
+    cmap = colormaps["tab20"].resampled(max(len(unique_labels), 1))
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    # Peaks first, so the coloured cells render on top of them.
+    ax.scatter(
+        peak_coords[:, 0], peak_coords[:, 1],
+        color="lightgrey", s=1, alpha=0.3, label="Peaks", rasterized=True,
+    )
+    for i, lab in enumerate(unique_labels):
+        mask = cell_labels == lab
+        ax.scatter(
+            cell_coords[mask, 0], cell_coords[mask, 1],
+            color=[cmap(i)], s=2, alpha=0.6, label=lab, rasterized=True,
+        )
+    ax.set_title(title, fontsize=13)
+    ax.set_xlabel("UMAP 1")
+    ax.set_ylabel("UMAP 2")
+    ax.legend(
+        title=label_name, markerscale=4,
+        bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=7,
+    )
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out_path}")
 
 def run_lsa(
     X_bin: sp.csr_matrix,
@@ -207,6 +279,7 @@ def evaluate(
     seed: int = 42,
     label_col: str = None,
     min_cells_pct: float = 0.001,
+    joint_max_peaks: int = None,
 ):
     os.makedirs(out_dir, exist_ok=True)
 
@@ -277,6 +350,49 @@ def evaluate(
         label_name="Cluster",
     )
     np.save(os.path.join(out_dir, "umap_ldm_coords.npy"), umap_coords)
+
+    # 3D UMAP of the LDM cell embeddings, coloured by FACS cell type
+    print("\n  Computing 3D UMAP for LDM cell embeddings...")
+    umap_coords_3d = compute_umap(z_cells, seed=seed, n_components=3)
+    plot_umap_3d(
+        umap_coords_3d, true_labels,
+        title="LDM Cell Embeddings (3D) — Cell type (FACS)",
+        out_path=os.path.join(out_dir, "umap_ldm_celltype_3d.png"),
+    )
+    np.save(os.path.join(out_dir, "umap_ldm_coords_3d.npy"), umap_coords_3d)
+
+    # Joint cell + peak UMAP in the shared latent space — the core LDM idea
+    z_peaks_path = os.path.join(ldm_dir, "z_peaks.npy")
+    if os.path.exists(z_peaks_path):
+        z_peaks = np.load(z_peaks_path)
+        print(f"\n  LDM peak embeddings : {z_peaks.shape}")
+        if z_peaks.shape[1] != z_cells.shape[1]:
+            print("  WARNING: peak/cell embedding dims differ — skipping joint UMAP")
+        else:
+            if joint_max_peaks is not None and z_peaks.shape[0] > joint_max_peaks:
+                rng = np.random.default_rng(seed)
+                sel = rng.choice(z_peaks.shape[0], size=joint_max_peaks,
+                                 replace=False)
+                z_peaks_plot = z_peaks[sel]
+                print(f"  Subsampled peaks for joint UMAP: {joint_max_peaks}")
+            else:
+                z_peaks_plot = z_peaks
+
+            n_cells_ = z_cells.shape[0]
+            print(f"  Computing joint cell+peak UMAP "
+                  f"({n_cells_ + z_peaks_plot.shape[0]} points)...")
+            joint = np.vstack([z_cells, z_peaks_plot])
+            joint_coords = compute_umap(joint, seed=seed)
+            plot_joint_umap(
+                cell_coords=joint_coords[:n_cells_],
+                peak_coords=joint_coords[n_cells_:],
+                cell_labels=true_labels,
+                title="Joint Cell + Peak Embedding (LDM)",
+                out_path=os.path.join(out_dir, "umap_joint_cellpeak.png"),
+            )
+            np.save(os.path.join(out_dir, "umap_joint_coords.npy"), joint_coords)
+    else:
+        print(f"\n  z_peaks.npy not found at {z_peaks_path} — skipping joint UMAP")
 
     # LSA baseline (same k, same evaluation)
     lsa_scores = run_lsa(X_bin, true_labels, k=k, seed=seed, out_dir=out_dir)
@@ -352,6 +468,9 @@ if __name__ == "__main__":
                    help="Override the obs column holding FACS cell type labels.")
     p.add_argument("--min_cells_pct", type=float, default=0.001,
                    help="Peak filter; must match the training run (PeakVI: 0.001).")
+    p.add_argument("--joint_max_peaks", type=int, default=None,
+                   help="Optionally subsample peaks for the joint cell+peak UMAP "
+                        "(default: use all peaks).")
     args = p.parse_args()
 
     evaluate(
@@ -363,4 +482,5 @@ if __name__ == "__main__":
         seed          = args.seed,
         label_col     = args.label_col,
         min_cells_pct = args.min_cells_pct,
+        joint_max_peaks = args.joint_max_peaks,
     )

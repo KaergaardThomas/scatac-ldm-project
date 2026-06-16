@@ -116,10 +116,10 @@ After training, `results/ldm_run/` contains:
 
 | Flag             | Default | Description                               |
 |------------------|---------|-------------------------------------------|
-| `--latent_dim`   | `8`     | Embedding dimensionality                  |
-| `--epochs`       | `200`   | Training epochs                           |
-| `--batch_size`   | `4096`  | Edges per mini-batch                      |
-| `--neg_ratio`    | `10`    | Negative edges sampled per positive       |
-| `--lr`           | `1e-3`  | Adam learning rate                        |
-| `--weight_decay` | `1e-4`  | L2 regularisation (embeddings only)       |
+| `--latent_dim`   | `16`    | Embedding dimensionality                  |
+| `--epochs`       | `25`    | Training epochs                           |
+| `--batch_size`   | `32768` | Edges per mini-batch                      |
+| `--neg_ratio`    | `70`    | Negative edges sampled per positive       |
+| `--lr`           | `1e-2`  | Adam learning rate                        |
+| `--weight_decay` | `0.0`   | L2 regularisation (embeddings only)       |
 | `--eval_every`   | `10`    | Validate every N epochs                   |

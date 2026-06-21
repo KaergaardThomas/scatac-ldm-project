@@ -113,7 +113,8 @@ class LightningLDM(pl.LightningModule):
         return loss
 
     def on_train_epoch_end(self):
-        if self.train_start_time is not None:
+        # Only log ETA from the global rank 0 process to prevent duplicate printing
+        if self.trainer.is_global_zero and self.train_start_time is not None:
             epochs_completed = self.current_epoch + 1
             elapsed_time = time.time() - self.train_start_time
             avg_time_per_epoch = elapsed_time / epochs_completed
@@ -172,9 +173,10 @@ class LightningLDM(pl.LightningModule):
         self.log("val_auc_pr", auprc, sync_dist=True)
         self.log("val_f1", best_f1, sync_dist=True)
 
-        print(
-            f"\nEvaluation done! AUC-ROC: {auroc:.4f} | AUC-PR: {auprc:.4f} | F1: {best_f1:.4f}"
-        )
+        if self.trainer.is_global_zero:
+            print(
+                f"\nEvaluation done! AUC-ROC: {auroc:.4f} | AUC-PR: {auprc:.4f} | F1: {best_f1:.4f}"
+            )
 
         # Reset states for the next epoch
         self.val_auroc.reset()
@@ -229,7 +231,7 @@ def run_train_pipeline(
     out_data_path: str,
     model_dir: str,
     accelerator: str,
-    devices: int,
+    device_list: list,
     resolution: float,
     min_cells_fraction: float,
     epochs: int,
@@ -241,6 +243,7 @@ def run_train_pipeline(
     os.makedirs(os.path.dirname(os.path.abspath(out_data_path)), exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
+    print(f"\n--- Starting workflow for Latent Dimension: {latent_dim} ---")
     print("Loading data...")
     adata = sc.read_h5ad(data_path)
     adata.obs_names_make_unique()
@@ -302,13 +305,16 @@ def run_train_pipeline(
     )
 
     eval_callback = MetricHistoryCallback()
-    strategy = (
-        "ddp" if (accelerator in ["cuda", "gpu", "auto"] and devices > 1) else "auto"
-    )
+
+    # Configure DDP strategy if multiple specific device IDs are passed
+    if accelerator in ["cuda", "gpu"] and len(device_list) > 1:
+        strategy = "ddp"
+    else:
+        strategy = "auto"
 
     trainer = pl.Trainer(
         accelerator=accelerator,
-        devices=devices,
+        devices=device_list,
         strategy=strategy,
         max_epochs=epochs,
         check_val_every_n_epoch=check_val_every_n_epoch,
@@ -322,63 +328,67 @@ def run_train_pipeline(
         lightning_model, train_dataloaders=train_loader, val_dataloaders=val_loader
     )
 
-    print(f"\nSaving model to {model_dir}...")
-    torch.save(
-        lightning_model.model.state_dict(), os.path.join(model_dir, "ldm_weights.pt")
-    )
-
-    # Save history JSON for the plotting script
-    hist_path = os.path.join(model_dir, "history.json")
-    with open(hist_path, "w") as f:
-        json.dump(eval_callback.history, f, indent=4)
-    print(f"Saved evaluation metrics to {hist_path}")
-
-    # --- Latent Extraction & Clustering ---
-    print("\nExtracting latent representation...")
-    LDM_LATENT_KEY = "X_ldm"
-    with torch.no_grad():
-        all_cells = torch.arange(n_cells)
-        if lightning_model.device.type != "cpu":
-            all_cells = all_cells.to(lightning_model.device)
-        latent = lightning_model.model.z_i(all_cells).cpu().numpy()
-
-    adata.obsm[LDM_LATENT_KEY] = latent
-
-    print(f"\nComputing k-nearest-neighbor graph (use_rep='{LDM_LATENT_KEY}')...")
-    sc.pp.neighbors(adata, use_rep=LDM_LATENT_KEY)
-    LDM_CLUSTERS_KEY = "clusters_ldm"
-
-    try:
-        sc.tl.leiden(
-            adata,
-            key_added=LDM_CLUSTERS_KEY,
-            resolution=resolution,
-            flavor="igraph",
-            n_iterations=2,
-            directed=False,
+    # Multi-process safeguard: Only write to files on the main master process
+    if trainer.is_global_zero:
+        print(f"\nSaving model to {model_dir}...")
+        torch.save(
+            lightning_model.model.state_dict(),
+            os.path.join(model_dir, "ldm_weights.pt"),
         )
-    except Exception:
-        sc.tl.leiden(adata, key_added=LDM_CLUSTERS_KEY, resolution=resolution)
 
-    print(f"\nWriting updated AnnData object to {out_data_path}...")
-    adata.write_h5ad(out_data_path)
-    print("Training pipeline complete.")
+        # Save history JSON for the plotting script
+        hist_path = os.path.join(model_dir, "history.json")
+        with open(hist_path, "w") as f:
+            json.dump(eval_callback.history, f, indent=4)
+        print(f"Saved evaluation metrics to {hist_path}")
+
+        # --- Latent Extraction & Clustering ---
+        print("\nExtracting latent representation...")
+        LDM_LATENT_KEY = "X_ldm"
+        with torch.no_grad():
+            all_cells = torch.arange(n_cells)
+            if lightning_model.device.type != "cpu":
+                all_cells = all_cells.to(lightning_model.device)
+            latent = lightning_model.model.z_i(all_cells).cpu().numpy()
+
+        adata.obsm[LDM_LATENT_KEY] = latent
+
+        print(f"\nComputing k-nearest-neighbor graph (use_rep='{LDM_LATENT_KEY}')...")
+        sc.pp.neighbors(adata, use_rep=LDM_LATENT_KEY)
+        LDM_CLUSTERS_KEY = "clusters_ldm"
+
+        try:
+            sc.tl.leiden(
+                adata,
+                key_added=LDM_CLUSTERS_KEY,
+                resolution=resolution,
+                flavor="igraph",
+                n_iterations=2,
+                directed=False,
+            )
+        except Exception:
+            sc.tl.leiden(adata, key_added=LDM_CLUSTERS_KEY, resolution=resolution)
+
+        print(f"\nWriting updated AnnData object to {out_data_path}...")
+        adata.write_h5ad(out_data_path)
+        print(f"Training pipeline complete for dimension {latent_dim}.\n")
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Train LDM and generate cluster labels")
-    p.add_argument(
-        "--data", type=str, default="data/hematopoiesis_GSE129785_FACS_sorted.h5ad"
-    )
-    p.add_argument("--out_data", type=str, default="data/hematopoiesis_with_ldm.h5ad")
-    p.add_argument("--model_dir", type=str, default="results/ldm_model")
     p.add_argument(
         "--accelerator",
         type=str,
         default="cuda",
         choices=["auto", "cpu", "cuda", "mps"],
     )
-    p.add_argument("--devices", type=int, default=1)
+    p.add_argument(
+        "--device",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Specify specific device indices (e.g. --device 0 1 for dual GPU DDP).",
+    )
     p.add_argument("--epochs", type=int, default=200)
     p.add_argument("--batch_size", type=int, default=2048)
     p.add_argument("--resolution", type=float, default=0.2)
@@ -386,8 +396,9 @@ if __name__ == "__main__":
     p.add_argument(
         "--latent_dim",
         type=int,
-        default=8,
-        help="Dimensionality of the shared latent embedding space.",
+        nargs="+",
+        default=[8],
+        help="One or more dimensionalities of the shared latent embedding space (e.g. --latent_dim 8 16).",
     )
 
     # Arguments for Validation Tracking
@@ -406,17 +417,27 @@ if __name__ == "__main__":
 
     args = p.parse_args()
 
-    run_train_pipeline(
-        data_path=args.data,
-        out_data_path=args.out_data,
-        model_dir=args.model_dir,
-        accelerator=args.accelerator,
-        devices=args.devices,
-        resolution=args.resolution,
-        min_cells_fraction=args.min_cells_fraction,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        latent_dim=args.latent_dim,
-        val_split=args.val_split,
-        check_val_every_n_epoch=args.check_val_every_n_epoch,
-    )
+    # Hardcoded predetermined paths
+    BASE_DATA_PATH = "data/hematopoiesis_GSE129785_FACS_sorted.h5ad"
+    BASE_OUT_DATA = "data/hematopoiesis_with_ldm"
+    BASE_MODEL_DIR = "results/ldm_model"
+
+    # Execute for each chosen latent dimensionality
+    for dim in args.latent_dim:
+        current_out_data = f"{BASE_OUT_DATA}_dim{dim}.h5ad"
+        current_model_dir = os.path.join(BASE_MODEL_DIR, f"dim_{dim}")
+
+        run_train_pipeline(
+            data_path=BASE_DATA_PATH,
+            out_data_path=current_out_data,
+            model_dir=current_model_dir,
+            accelerator=args.accelerator,
+            device_list=args.device,
+            resolution=args.resolution,
+            min_cells_fraction=args.min_cells_fraction,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            latent_dim=dim,
+            val_split=args.val_split,
+            check_val_every_n_epoch=args.check_val_every_n_epoch,
+        )

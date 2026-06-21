@@ -2,7 +2,7 @@
 train_ldm.py — Training script using PyTorch Lightning for custom LDM.
 Includes support for validation metrics via torchmetrics: AUC-ROC, AUC-PR, and F1.
 Metric computation and negative sampling are strictly executed on the GPU.
-Includes real-time ETA tracking.
+Includes real-time ETA tracking and multi-seed execution support.
 """
 
 import argparse
@@ -239,11 +239,14 @@ def run_train_pipeline(
     latent_dim: int,
     val_split: float,
     check_val_every_n_epoch: int,
+    seed: int,
 ):
     os.makedirs(os.path.dirname(os.path.abspath(out_data_path)), exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
-    print(f"\n--- Starting workflow for Latent Dimension: {latent_dim} ---")
+    print(
+        f"\n--- Starting workflow for Seed: {seed} | Latent Dimension: {latent_dim} ---"
+    )
     print("Loading data...")
     adata = sc.read_h5ad(data_path)
     adata.obs_names_make_unique()
@@ -371,7 +374,9 @@ def run_train_pipeline(
 
         print(f"\nWriting updated AnnData object to {out_data_path}...")
         adata.write_h5ad(out_data_path)
-        print(f"Training pipeline complete for dimension {latent_dim}.\n")
+        print(
+            f"Training pipeline complete for seed {seed} and dimension {latent_dim}.\n"
+        )
 
 
 if __name__ == "__main__":
@@ -400,6 +405,13 @@ if __name__ == "__main__":
         default=[8],
         help="One or more dimensionalities of the shared latent embedding space (e.g. --latent_dim 8 16).",
     )
+    p.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=[42],
+        help="One or more random seeds for reproducibility (e.g. --seeds 42 100 2026).",
+    )
 
     # Arguments for Validation Tracking
     p.add_argument(
@@ -422,22 +434,27 @@ if __name__ == "__main__":
     BASE_OUT_DATA = "data/hematopoiesis_with_ldm"
     BASE_MODEL_DIR = "results/ldm_model"
 
-    # Execute for each chosen latent dimensionality
-    for dim in args.latent_dim:
-        current_out_data = f"{BASE_OUT_DATA}_dim{dim}.h5ad"
-        current_model_dir = os.path.join(BASE_MODEL_DIR, f"dim_{dim}")
+    # Outer loop over seeds, inner loop over configurations
+    for seed in args.seeds:
+        # Globally seed PyTorch, NumPy, and python standard random library
+        pl.seed_everything(seed, workers=True)
 
-        run_train_pipeline(
-            data_path=BASE_DATA_PATH,
-            out_data_path=current_out_data,
-            model_dir=current_model_dir,
-            accelerator=args.accelerator,
-            device_list=args.device,
-            resolution=args.resolution,
-            min_cells_fraction=args.min_cells_fraction,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            latent_dim=dim,
-            val_split=args.val_split,
-            check_val_every_n_epoch=args.check_val_every_n_epoch,
-        )
+        for dim in args.latent_dim:
+            current_out_data = f"{BASE_OUT_DATA}_seed{seed}_dim{dim}.h5ad"
+            current_model_dir = os.path.join(BASE_MODEL_DIR, f"seed_{seed}_dim_{dim}")
+
+            run_train_pipeline(
+                data_path=BASE_DATA_PATH,
+                out_data_path=current_out_data,
+                model_dir=current_model_dir,
+                accelerator=args.accelerator,
+                device_list=args.device,
+                resolution=args.resolution,
+                min_cells_fraction=args.min_cells_fraction,
+                epochs=args.epochs,
+                batch_size=args.batch_size,
+                latent_dim=dim,
+                val_split=args.val_split,
+                check_val_every_n_epoch=args.check_val_every_n_epoch,
+                seed=seed,
+            )

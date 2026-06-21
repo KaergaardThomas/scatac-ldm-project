@@ -1,0 +1,465 @@
+"""
+train_ldm.py — Training script using PyTorch Lightning for custom LDM.
+Includes support for validation metrics: AUC-ROC, AUC-PR, and F1.
+Metric computation is threaded, with a safety mechanism to pause and catch up
+to prevent memory overload. Includes real-time ETA tracking.
+"""
+
+import argparse
+import json
+import os
+import threading
+import time
+import datetime
+import scanpy as sc
+import scipy.sparse as sp
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    f1_score,
+    precision_recall_curve,
+)
+
+# Handle lightning import
+try:
+    import lightning.pytorch as pl
+    from lightning.pytorch.callbacks import Callback
+except ImportError:
+    import pytorch_lightning as pl
+    from pytorch_lightning.callbacks import Callback
+
+# ==========================================
+# 1. IMPORT YOUR MODEL HERE
+# ==========================================
+from src.ldm import LDM
+
+
+# ==========================================
+# 2. DATASET & DATALOADER
+# ==========================================
+class BipartiteEdgeDataset(Dataset):
+    def __init__(self, cells: np.ndarray, peaks: np.ndarray, batch_size: int):
+        super().__init__()
+        # Create tensors
+        self.cells = torch.tensor(cells, dtype=torch.long)
+        self.peaks = torch.tensor(peaks, dtype=torch.long)
+
+        # Shuffle natively
+        perm = torch.randperm(len(self.cells))
+        self.cells = self.cells[perm]
+        self.peaks = self.peaks[perm]
+
+        self.num_edges = len(self.cells)
+        self.batch_size = batch_size
+
+    def __len__(self):
+        return (self.num_edges + self.batch_size - 1) // self.batch_size
+
+    def __getitem__(self, idx):
+        start_idx = idx * self.batch_size
+        end_idx = min(start_idx + self.batch_size, self.num_edges)
+        return self.cells[start_idx:end_idx], self.peaks[start_idx:end_idx]
+
+
+# ==========================================
+# 3. LIGHTNING MODULE WRAPPER
+# ==========================================
+class LightningLDM(pl.LightningModule):
+    def __init__(
+        self,
+        n_cells: int,
+        n_peaks: int,
+        latent_dim: int = 8,
+        lr: float = 1e-3,
+        pause_every_n_epochs: int = 5,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+        self.model = LDM(n_cells=n_cells, n_peaks=n_peaks, latent_dim=latent_dim)
+        self.loss_fn = nn.BCEWithLogitsLoss()
+        self.lr = lr
+        self.n_peaks = n_peaks
+        self.pause_every_n_epochs = pause_every_n_epochs
+
+        # Storage for validation step outputs
+        self.val_pos_logits = []
+        self.val_neg_logits = []
+
+        # Threading and Memory Management
+        self.eval_threads = []
+        self.history_lock = threading.Lock()
+        self.async_history = {
+            "val_auc_roc": [],
+            "val_auc_pr": [],
+            "val_f1": [],
+            "eval_epochs": [],
+        }
+
+        # Timing
+        self.train_start_time = None
+
+    def on_train_start(self):
+        self.train_start_time = time.time()
+
+    def forward(self, cell_idx, peak_idx):
+        return self.model(cell_idx, peak_idx)
+
+    def training_step(self, batch, batch_idx):
+        pos_c, pos_p = batch
+        neg_c = pos_c
+        neg_p = torch.randint(0, self.n_peaks, size=pos_p.shape, device=self.device)
+
+        pos_logits = self(pos_c, pos_p)
+        neg_logits = self(neg_c, neg_p)
+
+        loss = self.loss_fn(pos_logits, torch.ones_like(pos_logits)) + self.loss_fn(
+            neg_logits, torch.zeros_like(neg_logits)
+        )
+
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def on_train_epoch_end(self):
+        # Calculate ETA
+        if self.train_start_time is not None:
+            epochs_completed = self.current_epoch + 1
+            elapsed_time = time.time() - self.train_start_time
+            avg_time_per_epoch = elapsed_time / epochs_completed
+
+            remaining_epochs = self.trainer.max_epochs - epochs_completed
+            eta_seconds = remaining_epochs * avg_time_per_epoch
+            eta_str = str(datetime.timedelta(seconds=int(eta_seconds)))
+
+            print(
+                f"\n--- Epoch {epochs_completed}/{self.trainer.max_epochs} complete. Estimated Time Remaining: {eta_str} ---"
+            )
+
+    def validation_step(self, batch, batch_idx):
+        pos_c, pos_p = batch
+        neg_c = pos_c
+        neg_p = torch.randint(0, self.n_peaks, size=pos_p.shape, device=self.device)
+
+        pos_logits = self(pos_c, pos_p)
+        neg_logits = self(neg_c, neg_p)
+
+        # Log BCE Loss for validation
+        loss = self.loss_fn(pos_logits, torch.ones_like(pos_logits)) + self.loss_fn(
+            neg_logits, torch.zeros_like(neg_logits)
+        )
+        self.log("val_bce", loss, sync_dist=True)
+
+        # Store for epoch-end metric computation
+        self.val_pos_logits.append(pos_logits.detach().cpu())
+        self.val_neg_logits.append(neg_logits.detach().cpu())
+
+        return loss
+
+    def on_validation_epoch_end(self):
+        if not self.val_pos_logits:
+            return
+
+        pos = torch.cat(self.val_pos_logits).numpy()
+        neg = torch.cat(self.val_neg_logits).numpy()
+
+        # Clear memory immediately for the next epoch
+        self.val_pos_logits.clear()
+        self.val_neg_logits.clear()
+
+        epoch = self.current_epoch + 1
+
+        # Spawn a background thread to compute heavy metrics without pausing training immediately
+        eval_thread = threading.Thread(
+            target=self._compute_metrics_async, args=(epoch, pos, neg)
+        )
+        self.eval_threads.append(eval_thread)
+        eval_thread.start()
+
+        # Pause and catch up on threads every N epochs to prevent memory overflow
+        if self.pause_every_n_epochs > 0 and epoch % self.pause_every_n_epochs == 0:
+            active_threads = [t for t in self.eval_threads if t.is_alive()]
+            if active_threads:
+                print(
+                    f"\n[Memory Guard] Pausing to finish {len(active_threads)} active evaluation thread(s)..."
+                )
+                for t in active_threads:
+                    t.join()
+                print("[Memory Guard] All evaluations caught up. Resuming training.")
+
+            # Clean up the thread list
+            self.eval_threads = []
+
+    def _compute_metrics_async(self, epoch, pos, neg):
+        preds = np.concatenate([pos, neg])
+        targets = np.concatenate([np.ones_like(pos), np.zeros_like(neg)])
+
+        # Convert logits to probabilities
+        probs = 1 / (1 + np.exp(-preds))
+
+        # 1. AUC-ROC & AUC-PR
+        auc_roc = roc_auc_score(targets, probs)
+        auc_pr = average_precision_score(targets, probs)
+
+        # 2. Optimal F1 Score (Search thresholds)
+        precision, recall, thresholds = precision_recall_curve(targets, probs)
+        # Vectorized F1 calculation for all thresholds simultaneously
+        f1_scores = (2 * precision * recall) / (precision + recall + 1e-10)
+        best_f1 = np.max(f1_scores)
+
+        # Safely save to history
+        with self.history_lock:
+            self.async_history["eval_epochs"].append(epoch)
+            self.async_history["val_auc_roc"].append(float(auc_roc))
+            self.async_history["val_auc_pr"].append(float(auc_pr))
+            self.async_history["val_f1"].append(float(best_f1))
+
+        # Print notification when eval is done
+        print(
+            f"\n[Thread] Evaluation for epoch {epoch} done! AUC-ROC: {auc_roc:.4f} | AUC-PR: {auc_pr:.4f} | F1: {best_f1:.4f}"
+        )
+
+    def on_train_end(self):
+        # Final cleanup: ensure all threads finish before exiting
+        active_threads = [t for t in self.eval_threads if t.is_alive()]
+        if active_threads:
+            print("\nFinishing final evaluation threads before exiting...")
+            for t in active_threads:
+                t.join()
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
+
+class MetricHistoryCallback(Callback):
+    """Logs Train and Validation loss natively to history.json"""
+
+    def __init__(self):
+        super().__init__()
+        self.history = {
+            "train_loss": [],
+            "val_bce": [],
+            "eval_epochs": [],
+        }
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        if "train_loss" in metrics:
+            self.history["train_loss"].append(metrics["train_loss"].item())
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        metrics = trainer.callback_metrics
+        if "val_bce" not in metrics:
+            return
+
+        self.history["eval_epochs"].append(trainer.current_epoch + 1)
+        self.history["val_bce"].append(metrics["val_bce"].item())
+
+
+# ==========================================
+# 4. TRAINING PIPELINE
+# ==========================================
+def run_train_pipeline(
+    data_path: str,
+    out_data_path: str,
+    model_dir: str,
+    accelerator: str,
+    devices: int,
+    resolution: float,
+    min_cells_fraction: float,
+    epochs: int,
+    batch_size: int,
+    latent_dim: int,
+    val_split: float,
+    check_val_every_n_epoch: int,
+    pause_every_n_epochs: int,
+):
+    os.makedirs(os.path.dirname(os.path.abspath(out_data_path)), exist_ok=True)
+    os.makedirs(model_dir, exist_ok=True)
+
+    print("Loading data...")
+    adata = sc.read_h5ad(data_path)
+    adata.obs_names_make_unique()
+
+    min_cells = int(adata.n_obs * min_cells_fraction)
+    sc.pp.filter_genes(adata, min_cells=min_cells)
+    n_cells, n_peaks = adata.shape
+
+    print("\nPreparing Train/Val splits...")
+    X_coo = (
+        adata.X.tocoo() if sp.isspmatrix(adata.X) else sp.csr_matrix(adata.X).tocoo()
+    )
+    cells, peaks = X_coo.row, X_coo.col
+
+    # Random Split
+    perm = np.random.permutation(len(cells))
+    n_val = int(len(cells) * val_split)
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+
+    train_cells, train_peaks = cells[train_idx], peaks[train_idx]
+    val_cells, val_peaks = cells[val_idx], peaks[val_idx]
+
+    train_dataset = BipartiteEdgeDataset(
+        train_cells, train_peaks, batch_size=batch_size
+    )
+    val_dataset = BipartiteEdgeDataset(val_cells, val_peaks, batch_size=batch_size)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=None,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True if accelerator in ["cuda", "gpu"] else False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=None,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True if accelerator in ["cuda", "gpu"] else False,
+    )
+
+    print(f"Initializing LightningLDM model (n_cells={n_cells}, n_peaks={n_peaks})...")
+    lightning_model = LightningLDM(
+        n_cells=n_cells,
+        n_peaks=n_peaks,
+        latent_dim=latent_dim,
+        pause_every_n_epochs=pause_every_n_epochs,
+    )
+
+    eval_callback = MetricHistoryCallback()
+    strategy = (
+        "ddp" if (accelerator in ["cuda", "gpu", "auto"] and devices > 1) else "auto"
+    )
+
+    trainer = pl.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        strategy=strategy,
+        max_epochs=epochs,
+        check_val_every_n_epoch=check_val_every_n_epoch,
+        callbacks=[eval_callback],
+        enable_checkpointing=False,
+        logger=False,
+    )
+
+    print("\nStarting training...")
+    trainer.fit(
+        lightning_model, train_dataloaders=train_loader, val_dataloaders=val_loader
+    )
+
+    print(f"\nSaving model to {model_dir}...")
+    torch.save(
+        lightning_model.model.state_dict(), os.path.join(model_dir, "ldm_weights.pt")
+    )
+
+    # Merge synchronized loss history with async evaluation history
+    final_history = eval_callback.history.copy()
+    with lightning_model.history_lock:
+        for k, v in lightning_model.async_history.items():
+            if k == "eval_epochs":
+                continue  # Using the callback's eval_epochs to align
+            final_history[k] = v
+
+    # Save history JSON for the plotting script
+    hist_path = os.path.join(model_dir, "history.json")
+    with open(hist_path, "w") as f:
+        json.dump(final_history, f, indent=4)
+    print(f"Saved evaluation metrics to {hist_path}")
+
+    # --- Latent Extraction & Clustering ---
+    print("\nExtracting latent representation...")
+    LDM_LATENT_KEY = "X_ldm"
+    with torch.no_grad():
+        all_cells = torch.arange(n_cells)
+        if lightning_model.device.type != "cpu":
+            all_cells = all_cells.to(lightning_model.device)
+        latent = lightning_model.model.z_i(all_cells).cpu().numpy()
+
+    adata.obsm[LDM_LATENT_KEY] = latent
+
+    print(f"\nComputing k-nearest-neighbor graph (use_rep='{LDM_LATENT_KEY}')...")
+    sc.pp.neighbors(adata, use_rep=LDM_LATENT_KEY)
+    LDM_CLUSTERS_KEY = "clusters_ldm"
+
+    try:
+        sc.tl.leiden(
+            adata,
+            key_added=LDM_CLUSTERS_KEY,
+            resolution=resolution,
+            flavor="igraph",
+            n_iterations=2,
+            directed=False,
+        )
+    except Exception:
+        sc.tl.leiden(adata, key_added=LDM_CLUSTERS_KEY, resolution=resolution)
+
+    print(f"\nWriting updated AnnData object to {out_data_path}...")
+    adata.write_h5ad(out_data_path)
+    print("Training pipeline complete.")
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Train LDM and generate cluster labels")
+    p.add_argument(
+        "--data", type=str, default="data/hematopoiesis_GSE129785_FACS_sorted.h5ad"
+    )
+    p.add_argument("--out_data", type=str, default="data/hematopoiesis_with_ldm.h5ad")
+    p.add_argument("--model_dir", type=str, default="results/ldm_model")
+    p.add_argument(
+        "--accelerator",
+        type=str,
+        default="cuda",
+        choices=["auto", "cpu", "cuda", "mps"],
+    )
+    p.add_argument("--devices", type=int, default=1)
+    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--batch_size", type=int, default=2048)
+    p.add_argument("--resolution", type=float, default=0.2)
+    p.add_argument("--min_cells_fraction", type=float, default=0.01)
+    p.add_argument(
+        "--latent_dim",
+        type=int,
+        default=8,
+        help="Dimensionality of the shared latent embedding space.",
+    )
+
+    # Arguments for Validation Tracking
+    p.add_argument(
+        "--val_split",
+        type=float,
+        default=0.1,
+        help="Fraction of edges to hold out for validation.",
+    )
+    p.add_argument(
+        "--check_val_every_n_epoch",
+        type=int,
+        default=1,
+        help="Run validation every N epochs.",
+    )
+    p.add_argument(
+        "--pause_every_n_epochs",
+        type=int,
+        default=5,
+        help="Pause the main thread every N epochs to let async evaluations finish and free memory. Set to 0 to disable.",
+    )
+
+    args = p.parse_args()
+
+    run_train_pipeline(
+        data_path=args.data,
+        out_data_path=args.out_data,
+        model_dir=args.model_dir,
+        accelerator=args.accelerator,
+        devices=args.devices,
+        resolution=args.resolution,
+        min_cells_fraction=args.min_cells_fraction,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        latent_dim=args.latent_dim,
+        val_split=args.val_split,
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
+        pause_every_n_epochs=args.pause_every_n_epochs,
+    )

@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, TensorDataset
+from lightning.pytorch.callbacks import ModelCheckpoint
 
 from torchmetrics.classification import (
     BinaryAUROC,
@@ -95,8 +96,8 @@ def build_eval_set(
     if observed_csr is not None:
         # Fast O(1) collision checking using SciPy sparse matrix indexing
         collisions = np.asarray(observed_csr[neg[:, 0], neg[:, 1]]).flatten()
-        bad = collisions == True
-        n_bad = int(bad.sum())
+        bad_indices = np.where(collisions)[0]  # Track ONLY the indices that are bad
+        n_bad = len(bad_indices)
 
         # Initialize the loading bar based on total negatives to process
         total_neg = len(neg)
@@ -107,13 +108,21 @@ def build_eval_set(
 
         tries = 0
         while n_bad > 0 and tries < 10:
-            neg[bad, 0] = rng.integers(0, n_cells, size=n_bad)
-            neg[bad, 1] = rng.integers(0, n_peaks, size=n_bad)
+            # Generate new proposals just for the bad indices
+            new_cells = rng.integers(0, n_cells, size=n_bad)
+            new_peaks = rng.integers(0, n_peaks, size=n_bad)
 
-            # Re-check the whole array for simplicity
-            collisions = np.asarray(observed_csr[neg[:, 0], neg[:, 1]]).flatten()
-            bad = collisions == True
-            new_n_bad = int(bad.sum())
+            # Overwrite the bad slots in the main array
+            neg[bad_indices, 0] = new_cells
+            neg[bad_indices, 1] = new_peaks
+
+            # Check ONLY the newly generated edges
+            new_collisions = np.asarray(observed_csr[new_cells, new_peaks]).flatten()
+            still_bad_mask = new_collisions == True
+
+            # Filter bad_indices down to the ones that are STILL bad
+            bad_indices = bad_indices[still_bad_mask]
+            new_n_bad = len(bad_indices)
 
             # Advance the bar by the amount of collisions we successfully resolved
             resolved_this_round = n_bad - new_n_bad
@@ -123,7 +132,7 @@ def build_eval_set(
             n_bad = new_n_bad
             tries += 1
 
-        pbar.close()  # Clean up the bar when done
+        pbar.close()
 
         if n_bad > 0:
             print(f"Warning: {n_bad} collisions could not be resolved after 10 tries.")
@@ -177,9 +186,9 @@ class LightningLDM(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.model = LDM(n_cells=n_cells, n_peaks=n_peaks, latent_dim=latent_dim)
-        self.loss_fn = nn.BCEWithLogitsLoss()
         self.lr = lr
         self.weight_decay = weight_decay
+        self.n_cells = n_cells
         self.n_peaks = n_peaks
 
         self.val_auroc = BinaryAUROC()
@@ -194,17 +203,32 @@ class LightningLDM(pl.LightningModule):
         return self.model(cell_idx, peak_idx)
 
     def training_step(self, batch, batch_idx):
-        # Preserved exactly as train_ldm.py: 1:1 on-the-fly peak-side corruption
         pos_c, pos_p = batch
-        neg_c = pos_c
-        neg_p = torch.randint(0, self.n_peaks, size=pos_p.shape, device=self.device)
+        B = pos_c.shape[0]
+        neg_ratio = 10
+        M = B * neg_ratio
 
-        pos_logits = self(pos_c, pos_p)
-        neg_logits = self(neg_c, neg_p)
+        # 1. Repeat positives to match neg_ratio
+        rep_c = pos_c.repeat(neg_ratio)
+        rep_p = pos_p.repeat(neg_ratio)
 
-        loss = self.loss_fn(pos_logits, torch.ones_like(pos_logits)) + self.loss_fn(
-            neg_logits, torch.zeros_like(neg_logits)
+        # 2. Symmetric coin-flip corruption (50% cell, 50% peak)
+        corrupt = torch.randint(0, 2, (M,), device=self.device)
+        rand_c = torch.randint(0, self.n_cells, (M,), device=self.device)
+        rand_p = torch.randint(0, self.n_peaks, (M,), device=self.device)
+
+        neg_c = torch.where(corrupt == 0, rand_c, rep_c)
+        neg_p = torch.where(corrupt == 0, rep_p, rand_p)
+
+        # 3. Concatenate and apply global BCE loss
+        all_c = torch.cat([pos_c, neg_c])
+        all_p = torch.cat([pos_p, neg_p])
+        y = torch.cat(
+            [torch.ones(B, device=self.device), torch.zeros(M, device=self.device)]
         )
+
+        logits = self(all_c, all_p)
+        loss = F.binary_cross_entropy_with_logits(logits, y)
 
         self.log("train_loss", loss, prog_bar=True)
         return loss
@@ -361,16 +385,23 @@ def run_train_pipeline(
     adata = sc.read_h5ad(data_path)
     adata.obs_names_make_unique()
 
+    # --- Data Binarization (Matches load_data in prepare_data.py) ---
+    X = adata.X
+    if not sp.issparse(X):
+        X = sp.csr_matrix(X)
+    X = X.astype(np.float32)
+    X.data[:] = 1.0  # Explicitly binarize
+    adata.X = X
+    # ----------------------------------------------------------------
+
     min_cells = int(adata.n_obs * min_cells_fraction)
     sc.pp.filter_genes(adata, min_cells=min_cells)
     n_cells, n_peaks = adata.shape
 
-    X_coo = (
-        adata.X.tocoo() if sp.isspmatrix(adata.X) else sp.csr_matrix(adata.X).tocoo()
-    )
+    X_coo = adata.X.tocoo()
     cells, peaks = X_coo.row, X_coo.col
 
-    # 1. Edge Split Logic (Replacing cell isolation split)
+    # 1. Edge Split Logic
     num_edges = len(cells)
     perm = np.random.permutation(num_edges)
     n_val = int(num_edges * val_split)
@@ -385,16 +416,9 @@ def run_train_pipeline(
     val_edges = np.column_stack((val_cells, val_peaks))
 
     print(f"split stats: train_edges={len(train_edges)}, val_edges={len(val_edges)}")
-    import gc  # Ensure gc is imported at the top of your file
-
-    # ---------------------------------------------------------
-    # The Block You Shared Begins Here
-    # ---------------------------------------------------------
 
     # 2. Build Fixed Eval Set (Optimized)
     all_pos = np.vstack([train_edges, val_edges])
-
-    # Create a sparse matrix instead of unique int64 keys
     data = np.ones(len(all_pos), dtype=bool)
     observed_csr = sp.csr_matrix(
         (data, (all_pos[:, 0], all_pos[:, 1])), shape=(n_cells, n_peaks)
@@ -409,9 +433,6 @@ def run_train_pipeline(
         observed_csr=observed_csr,
     )
 
-    print(f"built eval set")
-
-    # Aggressively free up System RAM before PyTorch takes over
     del all_pos
     del observed_csr
     del train_edges
@@ -422,22 +443,18 @@ def run_train_pipeline(
     train_dataset = BipartiteEdgeDataset(
         train_cells, train_peaks, batch_size=batch_size
     )
-
-    # Use our custom native batching dataset instead of TensorDataset
     val_dataset = FixedEvalDataset(val_c, val_p, val_y, batch_size=batch_size)
-    print(f"build 2")
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=None,  # None because dataset returns batches natively
+        batch_size=None,
         shuffle=True,
         num_workers=0,
         pin_memory=True if accelerator in ["cuda", "gpu"] else False,
     )
-
     val_loader = DataLoader(
         val_dataset,
-        batch_size=None,  # MUST be None to bypass the RAM-heavy collate function
+        batch_size=None,
         shuffle=False,
         num_workers=0,
         pin_memory=True if accelerator in ["cuda", "gpu"] else False,
@@ -451,6 +468,15 @@ def run_train_pipeline(
     )
     eval_callback = MetricHistoryCallback()
 
+    # --- ADDED: Checkpoint Callback to track best PR-AUC ---
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_auc_pr",
+        mode="max",
+        dirpath=model_dir,
+        filename="best_model",
+        save_weights_only=True,
+    )
+
     strategy = (
         "ddp" if (accelerator in ["cuda", "gpu"] and len(device_list) > 1) else "auto"
     )
@@ -461,8 +487,8 @@ def run_train_pipeline(
         strategy=strategy,
         max_epochs=epochs,
         check_val_every_n_epoch=check_val_every_n_epoch,
-        callbacks=[eval_callback],
-        enable_checkpointing=False,
+        callbacks=[eval_callback, checkpoint_callback],  # Added callback
+        enable_checkpointing=True,  # Turned ON
         logger=False,
     )
 
@@ -472,10 +498,16 @@ def run_train_pipeline(
     )
 
     if trainer.is_global_zero:
-        print(f"saving weights to {model_dir}")
+        # --- MODIFIED: Load best model before extracting embeddings ---
+        best_model_path = checkpoint_callback.best_model_path
+        if best_model_path:
+            print(f"Loading best weights from {best_model_path}")
+            lightning_model.load_state_dict(torch.load(best_model_path)["state_dict"])
+
+        # Save standard dict format for consistency
         torch.save(
             lightning_model.model.state_dict(),
-            os.path.join(model_dir, "ldm_weights.pt"),
+            os.path.join(model_dir, "ldm_weights_best.pt"),
         )
 
         hist_path = os.path.join(model_dir, "history.json")
@@ -483,6 +515,7 @@ def run_train_pipeline(
             json.dump(eval_callback.history, f, indent=4)
 
         print("extracting cell embeddings...")
+        lightning_model.eval()
         with torch.no_grad():
             all_cells = torch.arange(n_cells)
             if lightning_model.device.type != "cpu":

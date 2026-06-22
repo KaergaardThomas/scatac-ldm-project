@@ -9,7 +9,6 @@ build/
 
 # uv
 .venv/
-uv.lock
 
 # Data — never commit large files
 data/*
@@ -40,3 +39,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+./lightning_logs/**
+./plots/**
